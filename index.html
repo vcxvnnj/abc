@@ -1,362 +1,676 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
+<!doctype html>
+<html lang="zh">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI 隔空手势画板 (修复版)</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- 使用 unpkg CDN，在国内有时候比 jsdelivr 稳定一点 -->
-    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
-    
-    <style>
-        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
-        #output_canvas {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1;
-            transform: scaleX(-1); /* 镜像 */
-        }
-        #ui_overlay {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none;
-        }
-        .loading-screen {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: #111; color: white;
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            z-index: 100; transition: opacity 0.5s;
-        }
-        .virtual-menu {
-            position: absolute; top: 50%; left: 50%;
-            transform: translate(-50%, -50%) scale(0.8);
-            width: 80%; max-width: 400px;
-            background: rgba(20, 20, 20, 0.95);
-            border: 2px solid #00d2ff; border-radius: 20px;
-            padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px;
-            opacity: 0; transition: all 0.3s; pointer-events: none;
-        }
-        .virtual-menu.active { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-        .menu-item {
-            background: rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 15px;
-            text-align: center; color: white; border: 2px solid transparent;
-        }
-        .menu-item.selected { background: #00d2ff; color: black; }
-        .color-dot { width: 30px; height: 30px; border-radius: 50%; display: inline-block; border: 2px solid #fff; }
-        #debug_info {
-            position: absolute; top: 10px; left: 10px; color: yellow; font-family: monospace; font-size: 12px; z-index: 10;
-        }
-    </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>隔空写字 — MediaPipe 手势交互示例</title>
+<style>
+  :root{
+    --panel-bg: rgba(20,20,30,0.9);
+    --panel-accent: #6ee7b7;
+    --ui-radius: 12px;
+  }
+  html,body{height:100%;margin:0;background:#0b1020;color:#fff;font-family:system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
+  #container{position:relative;height:100vh;overflow:hidden;}
+  video#input_video{display:none;transform:scaleX(-1);} /* mirror hidden */
+  canvas{position:absolute;left:0;top:0;touch-action:none;}
+  #ui-panel{
+    position:absolute;
+    transform:translate(-50%,-120%);
+    min-width:220px;
+    background:var(--panel-bg);
+    border-radius:var(--ui-radius);
+    padding:10px;
+    display:none;
+    box-shadow:0 6px 24px rgba(0,0,0,0.6);
+    backdrop-filter: blur(6px);
+    z-index:20;
+    user-select:none;
+  }
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px;}
+  .tool{
+    background: rgba(255,255,255,0.06);
+    border-radius:10px;padding:8px;min-width:44px;text-align:center;cursor:pointer;
+    font-size:13px;
+  }
+  .tool.selected{outline:2px solid var(--panel-accent);box-shadow:0 4px 12px rgba(110,231,183,0.12)}
+  .color-swatch{width:32px;height:32px;border-radius:8px;cursor:pointer;border:2px solid rgba(255,255,255,0.06)}
+  #sizeValue{display:inline-block;width:36px;text-align:right;margin-left:6px}
+  #help {position:absolute;left:12px;bottom:12px;background:rgba(0,0,0,0.35);padding:8px 12px;border-radius:10px;font-size:13px}
+  #clearBtn{background:#ef4444;padding:6px 10px;border-radius:8px;cursor:pointer}
+  #status{position:absolute;right:12px;bottom:12px;background:rgba(255,255,255,0.06);padding:8px 12px;border-radius:10px;font-size:13px}
+  /* particle style is drawn via canvas */
+</style>
 </head>
 <body>
+<div id="container">
+  <video id="input_video" autoplay playsinline></video>
+  <!-- canvas: drawing layer (persistent strokes) -->
+  <canvas id="drawCanvas"></canvas>
+  <!-- canvas: overlay for live drawing / UI highlights / gestures -->
+  <canvas id="overlay"></canvas>
 
-    <!-- 加载层 -->
-    <div id="loading" class="loading-screen">
-        <div class="text-3xl font-bold mb-4">🖐 初始化中...</div>
-        <div id="loading_text" class="text-sm text-gray-400 text-center px-4">
-            正在从 Google 下载 AI 模型 (约10MB)...<br>
-            如果长时间卡住，请检查网络或开启代理。<br>
-            <span style="color:red">请勿直接双击HTML文件打开，请使用 localhost 或 HTTPS</span>
-        </div>
-        <div class="mt-8 w-64 h-2 bg-gray-800 rounded overflow-hidden">
-            <div id="loading_bar" class="h-full bg-blue-500 w-0 transition-all duration-300"></div>
-        </div>
+  <div id="ui-panel" aria-hidden="true">
+    <div class="row" style="justify-content:space-between">
+      <div style="font-weight:600">工具</div>
+      <div id="clearBtn">重置</div>
     </div>
-
-    <video id="input_video" style="display:none"></video>
-    <canvas id="output_canvas"></canvas>
-
-    <div id="ui_overlay">
-        <div id="debug_info">FPS: 0 | Model: Loading...</div>
-        <div class="absolute top-5 right-5 bg-black/50 px-4 py-2 rounded-full text-white text-sm">
-            <span id="current_tool">✏️ 画笔</span>
-        </div>
-
-        <div id="menu_panel" class="virtual-menu">
-            <div class="col-span-2 text-center text-white font-bold border-b border-gray-600 pb-2">工具箱 (食指悬停选择)</div>
-            <div class="menu-item" data-action="tool_pen">✏️ 画笔</div>
-            <div class="menu-item" data-action="tool_eraser">🧹 橡皮</div>
-            <div class="menu-item" data-action="color_red"><div class="color-dot" style="background:#f44"></div></div>
-            <div class="menu-item" data-action="color_green"><div class="color-dot" style="background:#4f4"></div></div>
-            <div class="menu-item" data-action="color_blue"><div class="color-dot" style="background:#44f"></div></div>
-            <div class="menu-item" data-action="clear_all">🗑️ 清空所有</div>
-        </div>
-        
-        <div class="absolute bottom-10 w-full text-center text-white/70 text-xs">
-            ✋ 张开手掌: 菜单 | 👌 捏合: 写字 | ☝️+✌️(剪刀手): 雪花消散
-        </div>
+    <div class="row" id="toolsRow">
+      <div class="tool" data-tool="pen" id="tool-pen">✏️ 笔</div>
+      <div class="tool" data-tool="eraser" id="tool-eraser">🧽 橡皮</div>
     </div>
+    <div class="row">
+      <div style="font-size:12px">颜色</div>
+      <div style="display:flex;gap:6px">
+        <div class="color-swatch" data-color="#ffffff" style="background:#ffffff"></div>
+        <div class="color-swatch" data-color="#ff6b6b" style="background:#ff6b6b"></div>
+        <div class="color-swatch" data-color="#6ee7b7" style="background:#6ee7b7"></div>
+        <div class="color-swatch" data-color="#60a5fa" style="background:#60a5fa"></div>
+        <div class="color-swatch" data-color="#facc15" style="background:#facc15"></div>
+      </div>
+    </div>
+    <div class="row" style="align-items:center">
+      <div style="font-size:12px">笔粗</div>
+      <input id="sizeRange" type="range" min="1" max="40" value="6" style="flex:1">
+      <div id="sizeValue">6</div>
+    </div>
+    <div style="font-size:12px;color:#bbb;margin-top:6px">操作提示：食指+拇指合拢写字；双手食指缩放；食指+中指展开触发消散</div>
+  </div>
 
-    <script>
-        const videoElement = document.getElementById('input_video');
-        const canvasElement = document.getElementById('output_canvas');
-        const canvasCtx = canvasElement.getContext('2d');
-        const loadingScreen = document.getElementById('loading');
-        const loadingBar = document.getElementById('loading_bar');
-        const debugInfo = document.getElementById('debug_info');
-        
-        let isModelLoaded = false;
-        let lastFrameTime = 0;
-        let particles = [];
-        
-        // 状态机
-        let state = {
-            menuOpen: false,
-            tool: 'pen',
-            color: '#ff4444',
-            lineWidth: 4,
-            scale: 1,
-            drawing: false,
-            menuTimer: 0
-        };
+  <div id="help">将手掌打开以呼出面板 ✋</div>
+  <div id="status">状态：等待手势</div>
+</div>
 
-        let strokes = []; // {points:[], color, width}
-        let currentLine = [];
+<!-- MediaPipe Hands and utilities -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script>
+/*
+  单文件实现：MediaPipe Hands + Canvas 绘画 + 手势控制 UI
+  作者：ChatGPT（示例）
+*/
 
-        // 调整画布尺寸
-        function resize() {
-            canvasElement.width = window.innerWidth;
-            canvasElement.height = window.innerHeight;
-        }
-        window.onresize = resize;
-        resize();
+/* ---------- 全局元素 ---------- */
+const video = document.getElementById('input_video');
+const overlay = document.getElementById('overlay');
+const drawCanvas = document.getElementById('drawCanvas');
+const ctxOverlay = overlay.getContext('2d');
+const ctxDraw = drawCanvas.getContext('2d');
 
-        // --- 粒子系统 ---
-        class Particle {
-            constructor(x, y, color) {
-                this.x = x; this.y = y; this.color = color;
-                this.vx = (Math.random()-0.5)*5; this.vy = Math.random()*5;
-                this.life = 1.0;
-            }
-            update() { this.x += this.vx; this.y += this.vy; this.life -= 0.02; }
-            draw(ctx) { 
-                ctx.globalAlpha = this.life; ctx.fillStyle = this.color; 
-                ctx.beginPath(); ctx.arc(this.x, this.y, 2, 0, Math.PI*2); ctx.fill(); 
-            }
-        }
+const panel = document.getElementById('ui-panel');
+const statusEl = document.getElementById('status');
+const helpEl = document.getElementById('help');
 
-        // --- 核心逻辑 ---
-        function onResults(results) {
-            // 1. 首次成功检测：关闭加载层
-            if (!isModelLoaded) {
-                isModelLoaded = true;
-                loadingBar.style.width = "100%";
-                setTimeout(() => loadingScreen.style.opacity = 0, 500);
-                setTimeout(() => loadingScreen.style.display = 'none', 1000);
-            }
+const toolPen = document.getElementById('tool-pen');
+const toolEraser = document.getElementById('tool-eraser');
+const colorSwatches = document.querySelectorAll('.color-swatch');
+const sizeRange = document.getElementById('sizeRange');
+const sizeValue = document.getElementById('sizeValue');
+const clearBtn = document.getElementById('clearBtn');
 
-            // 计算 FPS
-            const now = performance.now();
-            const fps = 1000 / (now - lastFrameTime);
-            lastFrameTime = now;
-            debugInfo.innerText = `FPS: ${fps.toFixed(1)} | Hands: ${results.multiHandLandmarks.length}`;
+/* ---------- 状态与设置 ---------- */
+let selectedTool = 'pen';
+let selectedColor = '#ffffff';
+let penSize = 6;
 
-            // 2. 绘制基础图层
-            canvasCtx.save();
-            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-            canvasCtx.fillStyle = 'rgba(0,0,0,0.4)'; // 变暗背景以便看清字
-            canvasCtx.fillRect(0,0, canvasElement.width, canvasElement.height);
+let panelVisible = false;
+let lastPanelPos = {x:0,y:0};
+let selectionHoverStart = null;
+let hoverTarget = null;
 
-            // 3. 处理手势
-            if (results.multiHandLandmarks.length > 0) {
-                const landmarks = results.multiHandLandmarks[0];
-                const w = canvasElement.width;
-                const h = canvasElement.height;
+let drawing = false; // 当前正用捏合画线
+let lastDrawPoint = null;
 
-                // 获取关键点坐标 (镜像处理: x = 1 - x)
-                const indexTip = { x: (1 - landmarks[8].x) * w, y: landmarks[8].y * h };
-                const thumbTip = { x: (1 - landmarks[4].x) * w, y: landmarks[4].y * h };
-                const middleTip = { x: (1 - landmarks[12].x) * w, y: landmarks[12].y * h };
-                
-                // 绘制手部骨架
-                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00ff00', lineWidth: 1});
+// Keep persistent strokes in drawCanvas (as image). We'll apply global transform for zoom.
+let globalScale = 1.0;
+let globalOffset = {x:0,y:0}; // not used heavily; center scaling around canvas center for simplicity
+let twoHandScaling = {active:false, startDist:0, startScale:1.0};
 
-                // --- 手势识别算法 ---
-                
-                // A. 计算距离
-                const pinchDist = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
-                const peaceDist = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y); // 食指与中指距离
-                const isHandOpen = landmarks[20].y < landmarks[18].y && landmarks[16].y < landmarks[14].y && landmarks[12].y < landmarks[10].y && landmarks[8].y < landmarks[6].y;
+// particle for disperse
+let particles = [];
+let dispersing = false;
 
-                // B. 状态机逻辑
-                
-                // 1. 剪刀手消散 (食指中指分开，其他弯曲，这里简化为检测“V”字手势)
-                // 简单判定：食指中指都伸直，且离得比较远
-                if (!state.menuOpen && results.multiHandLandmarks.length === 1) {
-                    // 如果食指和中指指尖距离 > 50px (视情况调整) 且没有捏合
-                    if (Math.hypot(landmarks[8].x - landmarks[12].x, landmarks[8].y - landmarks[12].y) > 0.05 && pinchDist > 60) {
-                         // 触发雪花
-                         if (strokes.length > 0) {
-                             strokes.forEach(s => s.points.forEach(p => {
-                                 if(Math.random()>0.8) particles.push(new Particle(p.x, p.y, s.color));
-                             }));
-                             strokes = [];
-                             currentLine = [];
-                         }
-                    }
-                }
+/* ---------- Helpers: resize canvases to video size ---------- */
+function resizeCanvasesToVideo() {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return;
+  [overlay, drawCanvas].forEach(c=>{
+    c.width = w;
+    c.height = h;
+    c.style.width = video.style.width || (w + 'px');
+    c.style.height = video.style.height || (h + 'px');
+  });
+  // scale overlay css to fill container
+  overlay.style.width = '100%';
+  overlay.style.height = '100%';
+  drawCanvas.style.width = '100%';
+  drawCanvas.style.height = '100%';
+}
 
-                // 2. 菜单开关 (五指张开)
-                // 这里用简单的逻辑：如果是张开手掌且不是在画画
-                if (isHandOpen && pinchDist > 80) {
-                    if (!state.menuOpen) {
-                        state.menuOpen = true;
-                        document.getElementById('menu_panel').classList.add('active');
-                    }
-                } else if (state.menuOpen && pinchDist < 30) {
-                    // 在菜单模式下捏合，可能是误操作或想关闭，这里简化为如果不张开就尝试关闭
-                    // 为了体验，我们让菜单保持打开直到选择了东西，或者手离开
-                }
+/* ---------- 简单几何 ---------- */
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+function lerp(a,b,t){return a + (b-a)*t;}
 
-                // 3. 菜单交互
-                if (state.menuOpen) {
-                    canvasCtx.beginPath();
-                    canvasCtx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI*2);
-                    canvasCtx.fillStyle = 'cyan';
-                    canvasCtx.fill();
-                    
-                    checkMenuHover(indexTip.x, indexTip.y);
-                } 
-                // 4. 书写模式
-                else {
-                    // 捏合判定 (阈值 40像素)
-                    if (pinchDist < 40) {
-                        if (!state.drawing) {
-                            state.drawing = true;
-                            currentLine = [];
-                        }
-                        currentLine.push({x: indexTip.x, y: indexTip.y});
-                    } else {
-                        if (state.drawing) {
-                            state.drawing = false;
-                            if (currentLine.length > 0) {
-                                strokes.push({points: [...currentLine], color: state.color, width: state.lineWidth, tool: state.tool});
-                            }
-                        }
-                    }
-                    
-                    // 绘制笔尖光标
-                    canvasCtx.beginPath();
-                    canvasCtx.arc(indexTip.x, indexTip.y, 5, 0, Math.PI*2);
-                    canvasCtx.fillStyle = state.drawing ? 'red' : 'white';
-                    canvasCtx.fill();
-                }
-            }
+/* ---------- 手指/手掌判定函数（经验阈值） ---------- */
+/*
+MediaPipe landmarks indexes:
+0: wrist
+1: thumb_cmc
+2: thumb_mcp
+3: thumb_ip
+4: thumb_tip
+5: index_finger_mcp
+6: index_finger_pip
+7: index_finger_dip
+8: index_finger_tip
+9: middle_finger_mcp
+10: middle_finger_pip
+11: middle_finger_dip
+12: middle_finger_tip
+13: ring_finger_mcp
+14: ring_finger_pip
+15: ring_finger_dip
+16: ring_finger_tip
+17: pinky_mcp
+18: pinky_pip
+19: pinky_dip
+20: pinky_tip
+*/
+function fingersExtended(landmarks){
+  // returns {thumb:boolean, index, middle, ring, pinky}
+  // For index/middle/ring/pinky: tip.y < pip.y usually means extended (camera flipped laterally)
+  const res = {};
+  try{
+    res.index = landmarks[8].y < landmarks[6].y;
+    res.middle = landmarks[12].y < landmarks[10].y;
+    res.ring = landmarks[16].y < landmarks[14].y;
+    res.pinky = landmarks[20].y < landmarks[18].y;
+    // thumb: compare tip.x relative to mcp (handedness unknown). We'll use tip.x vs ip.x - if far it is extended
+    res.thumb = Math.abs(landmarks[4].x - landmarks[2].x) > 0.04;
+  }catch(e){
+    return {thumb:false,index:false,middle:false,ring:false,pinky:false};
+  }
+  return res;
+}
 
-            // 4. 渲染笔迹
-            strokes.forEach(s => drawLine(s));
-            if (state.drawing && currentLine.length > 0) {
-                drawLine({points: currentLine, color: state.color, width: state.lineWidth, tool: state.tool});
-            }
+function isPalmOpen(landmarks){
+  // consider palm open if >=4 fingers extended
+  const f = fingersExtended(landmarks);
+  const count = [f.thumb,f.index,f.middle,f.ring,f.pinky].filter(Boolean).length;
+  return count >= 4;
+}
 
-            // 5. 渲染粒子
-            if (particles.length > 0) {
-                particles = particles.filter(p => p.life > 0);
-                particles.forEach(p => { p.update(); p.draw(canvasCtx); });
-            }
+function isPinch(landmarks, videoW, videoH){
+  // pinch if distance between index tip (8) and thumb tip (4) small
+  const d = Math.hypot((landmarks[8].x-landmarks[4].x)*videoW,(landmarks[8].y-landmarks[4].y)*videoH);
+  // threshold relative to diagonal
+  const diag = Math.hypot(videoW, videoH);
+  return d < diag * 0.045; // empirical
+}
 
-            canvasCtx.restore();
-        }
+function isIndexAndMiddleOpen(landmarks){
+  const f = fingersExtended(landmarks);
+  // both index and middle extended, and others not necessarily
+  return f.index && f.middle;
+}
 
-        function drawLine(stroke) {
-            if (stroke.points.length < 2) return;
-            canvasCtx.beginPath();
-            canvasCtx.lineWidth = stroke.width;
-            canvasCtx.lineCap = 'round';
-            canvasCtx.lineJoin = 'round';
-            canvasCtx.strokeStyle = stroke.tool === 'eraser' ? 'rgba(0,0,0,0.5)' : stroke.color;
-            // 橡皮擦其实应该用 globalCompositeOperation，但这里简化为半透明黑
-            
-            canvasCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
-            for(let i=1; i<stroke.points.length; i++) {
-                canvasCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
-            }
-            canvasCtx.stroke();
-        }
+/* ---------- UI helpers ---------- */
+function showPanelAt(x,y){
+  panel.style.left = (x * 100) + '%';
+  panel.style.top = (y * 100) + '%';
+  panel.style.display = 'block';
+  panel.setAttribute('aria-hidden','false');
+  panelVisible = true;
+}
+function hidePanel(){
+  panel.style.display = 'none';
+  panel.setAttribute('aria-hidden','true');
+  panelVisible = false;
+  selectionHoverStart = null;
+  hoverTarget = null;
+}
 
-        let selectionTimer = 0;
-        let lastSelected = null;
+/* ---------- UI selections (mouse-free) ---------- */
+function updatePanelHover(ix,iy,videoW,videoH){
+  // ix,iy are normalized (0..1) coord of index finger (mirrored)
+  // transform to panel DOM coordinates
+  const rect = panel.getBoundingClientRect();
+  if (rect.width === 0) return;
+  // map normalized coordinates to container pixels
+  const containerRect = document.getElementById('container').getBoundingClientRect();
+  const px = ix * containerRect.width;
+  const py = iy * containerRect.height;
+  // check children hit
+  const elems = [...panel.querySelectorAll('.tool,.color-swatch,#sizeRange,#clearBtn')];
+  let found = null;
+  elems.forEach(el=>{
+    const r = el.getBoundingClientRect();
+    if (px >= r.left && px <= r.right && py >= r.top && py <= r.bottom){
+      found = el;
+    }
+  });
+  if (found){
+    if (hoverTarget !== found){
+      hoverTarget = found;
+      selectionHoverStart = performance.now();
+      // visual highlight
+      elems.forEach(e=>e.classList && e.classList.remove('selected'));
+      if (found.classList.contains('tool')) found.classList.add('selected');
+      if (found.classList.contains('color-swatch')) found.style.outline = '2px solid var(--panel-accent)';
+    } else {
+      // stayed: if >500ms, select
+      if (performance.now() - selectionHoverStart > 500){
+        applyUISelection(found);
+        // prevent immediate re-trigger
+        selectionHoverStart = performance.now() + 400;
+      }
+    }
+  } else {
+    // clear highlights
+    const elems2 = [...panel.querySelectorAll('.tool,.color-swatch')];
+    elems2.forEach(e=>{
+      e.classList && e.classList.remove('selected');
+      if (e.classList.contains('color-swatch')) e.style.outline = 'none';
+    });
+    hoverTarget = null;
+    selectionHoverStart = null;
+  }
+}
 
-        function checkMenuHover(x, y) {
-            const items = document.querySelectorAll('.menu-item');
-            let hovered = false;
-            
-            items.forEach(item => {
-                const rect = item.getBoundingClientRect();
-                if (x > rect.left && x < rect.right && y > rect.top && y < rect.bottom) {
-                    hovered = true;
-                    item.classList.add('selected');
-                    if (lastSelected !== item) {
-                        selectionTimer = 0;
-                        lastSelected = item;
-                    } else {
-                        selectionTimer++;
-                    }
+function applyUISelection(el){
+  if (!el) return;
+  if (el.id === 'clearBtn'){
+    // clear draw canvas (with fade)
+    ctxDraw.clearRect(0,0,drawCanvas.width,drawCanvas.height);
+    return;
+  }
+  if (el.classList.contains('tool')){
+    selectedTool = el.dataset.tool;
+    toolPen.classList.toggle('selected', selectedTool === 'pen');
+    toolEraser.classList.toggle('selected', selectedTool === 'eraser');
+    statusEl.textContent = '状态：已选择 ' + (selectedTool === 'pen' ? '笔' : '橡皮');
+    return;
+  }
+  if (el.classList.contains('color-swatch')){
+    selectedColor = el.dataset.color;
+    colorSwatches.forEach(s=>s.style.outline = 'none');
+    el.style.outline = '2px solid var(--panel-accent)';
+    statusEl.textContent = '状态：已选择颜色 ' + selectedColor;
+    return;
+  }
+  if (el.id === 'sizeRange'){
+    // size handled automatically on change events
+  }
+}
 
-                    // 悬停 20 帧 (约0.5秒) 触发
-                    if (selectionTimer > 20) {
-                        const action = item.dataset.action;
-                        executeAction(action);
-                        state.menuOpen = false;
-                        document.getElementById('menu_panel').classList.remove('active');
-                        selectionTimer = 0;
-                    }
-                } else {
-                    item.classList.remove('selected');
-                }
-            });
-            
-            if (!hovered) { selectionTimer = 0; lastSelected = null; }
-        }
+/* ---------- Drawing 管理 ---------- */
+function screenToCanvasXY(nx, ny){
+  // nx,ny are normalized coords relative to video (0..1)
+  return {x: nx * drawCanvas.width, y: ny * drawCanvas.height};
+}
 
-        function executeAction(action) {
-            if (action === 'tool_pen') { state.tool = 'pen'; document.getElementById('current_tool').innerText = "✏️ 画笔"; }
-            if (action === 'tool_eraser') { state.tool = 'eraser'; state.color = '#000'; document.getElementById('current_tool').innerText = "🧹 橡皮"; }
-            if (action === 'color_red') { state.color = '#ff4444'; state.tool = 'pen'; }
-            if (action === 'color_green') { state.color = '#44ff44'; state.tool = 'pen'; }
-            if (action === 'color_blue') { state.color = '#4444ff'; state.tool = 'pen'; }
-            if (action === 'clear_all') { strokes = []; particles = []; }
-        }
+function startDrawingAt(pt){
+  drawing = true;
+  lastDrawPoint = pt;
+}
 
-        // --- 初始化 MediaPipe ---
-        const hands = new Hands({locateFile: (file) => {
-            // 使用 unpkg 源，尝试解决国内加载问题
-            return `https://unpkg.com/@mediapipe/hands/${file}`;
-        }});
+function stopDrawing(){
+  drawing = false;
+  lastDrawPoint = null;
+}
 
-        hands.setOptions({
-            maxNumHands: 2,
-            modelComplexity: 1,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
-        });
+function drawLineTo(pt){
+  if (!lastDrawPoint) lastDrawPoint = pt;
+  ctxDraw.save();
+  ctxDraw.globalCompositeOperation = (selectedTool === 'eraser') ? 'destination-out' : 'source-over';
+  ctxDraw.lineCap = 'round';
+  ctxDraw.lineJoin = 'round';
+  ctxDraw.strokeStyle = selectedTool === 'eraser' ? 'rgba(0,0,0,1)' : selectedColor;
+  ctxDraw.lineWidth = penSize;
+  ctxDraw.beginPath();
+  ctxDraw.moveTo(lastDrawPoint.x, lastDrawPoint.y);
+  ctxDraw.lineTo(pt.x, pt.y);
+  ctxDraw.stroke();
+  ctxDraw.restore();
+  lastDrawPoint = pt;
+}
 
-        hands.onResults(onResults);
+/* ---------- Disperse（雪花）效果 ---------- */
+function startDisperse(){
+  if (dispersing) return;
+  // sample non-transparent pixels from drawCanvas
+  const w = drawCanvas.width, h = drawCanvas.height;
+  const imageData = ctxDraw.getImageData(0,0,w,h);
+  const data = imageData.data;
+  const pts = [];
+  // sample with stride to control particle count
+  const stride = 6; // increase -> fewer particles
+  for (let y=0; y<h; y+=stride){
+    for (let x=0; x<w; x+=stride){
+      const idx = (y*w + x) * 4;
+      const alpha = data[idx+3];
+      if (alpha > 50){
+        pts.push({x,y, color: `rgba(${data[idx]},${data[idx+1]},${data[idx+2]},${data[idx+3]/255})`});
+      }
+    }
+  }
+  // choose up to N particles
+  const N = Math.min(900, pts.length);
+  particles = [];
+  for (let i=0;i<N;i++){
+    const p = pts[Math.floor(Math.random()*pts.length)];
+    particles.push({
+      x: p.x,
+      y: p.y,
+      vx: (Math.random()-0.5)*0.4 + (Math.random()-0.5)*1.0,
+      vy: Math.random()*0.6 + 0.6,
+      life: 1.0,
+      color: p.color,
+      size: Math.random()*3 + 1
+    });
+  }
+  // clear draw canvas to "release" them
+  ctxDraw.clearRect(0,0,w,h);
+  dispersing = true;
+  statusEl.textContent = '状态：消散中...';
+}
 
-        // 超时检测
-        setTimeout(() => {
-            if (!isModelLoaded) {
-                alert("加载超时！\n1. 请检查网络连接。\n2. 中国大陆用户可能需要代理。\n3. 请确保使用 HTTPS 协议打开网页。");
-                document.getElementById('loading_text').innerHTML = "<span style='color:red'>模型下载失败，请刷新重试</span>";
-            }
-        }, 15000);
+function updateParticles(dt){
+  if (!dispersing) return;
+  const w = drawCanvas.width, h = drawCanvas.height;
+  for (const p of particles){
+    p.x += p.vx * dt * 60;
+    p.y += p.vy * dt * 60;
+    p.vy += 0.002 * dt * 60;
+    p.life -= 0.0015 * dt * 60;
+  }
+  // remove dead
+  particles = particles.filter(p=>p.life > 0 && p.y < h + 30);
+  if (particles.length === 0){
+    dispersing = false;
+    statusEl.textContent = '状态：等待手势';
+  }
+}
 
-        // 启动摄像头
-        const camera = new Camera(videoElement, {
-            onFrame: async () => {
-                await hands.send({image: videoElement});
-            },
-            width: 1280,
-            height: 720
-        });
-        
-        camera.start().then(() => {
-            console.log("摄像头已启动，正在等待模型...");
-            loadingBar.style.width = "50%";
-        }).catch(e => {
-            alert("摄像头启动失败: " + e.message);
-        });
-    </script>
+function drawParticles(){
+  if (!dispersing) return;
+  ctxOverlay.save();
+  for (const p of particles){
+    ctxOverlay.globalAlpha = Math.max(0,p.life);
+    ctxOverlay.beginPath();
+    ctxOverlay.fillStyle = p.color;
+    ctxOverlay.arc(p.x, p.y, p.size, 0, Math.PI*2);
+    ctxOverlay.fill();
+  }
+  ctxOverlay.restore();
+}
+
+/* ---------- MediaPipe Hands setup ---------- */
+const hands = new Hands({locateFile: (file) => {
+  return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+}});
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.6,
+  minTrackingConfidence: 0.5
+});
+
+hands.onResults(onHandsResults);
+
+const camera = new Camera(video, {
+  onFrame: async () => {
+    await hands.send({image: video});
+  },
+  width: 1280,
+  height: 720
+});
+camera.start();
+
+/* ---------- 主处理回调 ---------- */
+let lastTime = performance.now();
+
+function onHandsResults(results){
+  // ensure canvases sized
+  if (video.videoWidth && video.videoHeight){
+    if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight){
+      resizeCanvasesToVideo();
+    }
+  }
+
+  // clear overlay each frame
+  ctxOverlay.clearRect(0,0,overlay.width,overlay.height);
+
+  const now = performance.now();
+  const dt = now - lastTime;
+  lastTime = now;
+
+  // draw existing drawing (drawCanvas) on overlay with globalScale transform
+  // We'll draw drawCanvas onto overlay before overlay drawings so overlay can show particles and gesture markers
+  ctxOverlay.save();
+  ctxOverlay.setTransform(globalScale, 0, 0, globalScale, (1-globalScale)*overlay.width/2, (1-globalScale)*overlay.height/2);
+  ctxOverlay.drawImage(drawCanvas, 0, 0);
+  ctxOverlay.restore();
+
+  // process hands
+  const multiHandLandmarks = results.multiHandLandmarks || [];
+  const multiHandedness = results.multiHandedness || []; // info about left/right
+  // mirror coordinates horizontally for intuitive mapping (because video mirrored)
+  // MediaPipe returns normalized (0..1) coords in results, with origin at top-left of image.
+  // We'll mirror x by x' = 1 - x for our UI coordinates (so displayed matches user's mirror).
+  // For ease: create processed array of hands with normalized landmarks mirrored
+  const handsData = multiHandLandmarks.map((lm, idx) => {
+    const mirrored = lm.map(p => ({x: 1 - p.x, y: p.y, z: p.z}));
+    return {landmarks: mirrored, handedness: (multiHandedness[idx] && multiHandedness[idx].label) || 'Unknown'};
+  });
+
+  // If any hand shows full palm open -> show panel near that hand (the first)
+  let palmHand = null;
+  for (const h of handsData){
+    if (isPalmOpen(h.landmarks)){
+      palmHand = h;
+      break;
+    }
+  }
+
+  if (palmHand && !panelVisible){
+    // show panel near wrist or palm center
+    const wrist = palmHand.landmarks[0];
+    const px = wrist.x; const py = wrist.y;
+    // position in normalized container coords, but we need mirrored mapping to CSS (video mirrored)
+    showPanelAt(px, py);
+    statusEl.textContent = '状态：面板已呼出，食指指向选择';
+  } else if (!palmHand && panelVisible){
+    // if panel visible and palm not detected, leave it until palm reappears to close
+    // But user spec: "选择完相应功能后，检测到整个手掌后退出UI面板" -> so close panel when a palm is detected AFTER selection
+    // We'll close panel when a palm is detected and selection made (status changed). For simplicity, if panel visible and we detect a palm again, we close.
+    // Here we keep panel until explicit palm close handled below.
+  }
+
+  // If panel visible and hand present, compute index finger pos to hover/select
+  if (panelVisible && handsData.length > 0){
+    const primary = handsData[0];
+    const idxTip = primary.landmarks[8]; // normalized mirrored
+    updatePanelHover(idxTip.x, idxTip.y, overlay.width, overlay.height);
+    // draw indicator
+    const p = screenToCanvasXY(idxTip.x, idxTip.y);
+    ctxOverlay.beginPath();
+    ctxOverlay.fillStyle = 'rgba(255,255,255,0.9)';
+    ctxOverlay.arc(p.x, p.y, 6, 0, Math.PI*2);
+    ctxOverlay.fill();
+  }
+
+  // If panel visible and we detect a full palm again (after some selection), close it
+  if (panelVisible && palmHand){
+    // close panel
+    hidePanel();
+    statusEl.textContent = '状态：面板已关闭';
+  }
+
+  // Gesture: drawing (pinch) on any hand
+  let pinchHand = null;
+  for (const h of handsData){
+    if (isPinch(h.landmarks, overlay.width, overlay.height)){
+      pinchHand = h;
+      break;
+    }
+  }
+
+  if (pinchHand){
+    // get index tip pos
+    const nt = pinchHand.landmarks[8];
+    const pt = screenToCanvasXY(nt.x, nt.y);
+    if (!drawing){
+      // start drawing
+      startDrawingAt(pt);
+      statusEl.textContent = '状态：绘制中';
+    } else {
+      drawLineTo(pt);
+    }
+  } else {
+    if (drawing){
+      stopDrawing();
+      statusEl.textContent = '状态：绘制完成';
+    }
+  }
+
+  // two-hand index scaling: require two hands present and both have index extended
+  if (handsData.length >= 2){
+    const h1 = handsData[0], h2 = handsData[1];
+    const f1 = fingersExtended(h1.landmarks);
+    const f2 = fingersExtended(h2.landmarks);
+    if (f1.index && f2.index && !twoHandScaling.active && !dispersing){
+      // start scaling
+      twoHandScaling.active = true;
+      twoHandScaling.startDist = dist({x:h1.landmarks[8].x,y:h1.landmarks[8].y},{x:h2.landmarks[8].x,y:h2.landmarks[8].y});
+      twoHandScaling.startScale = globalScale;
+      statusEl.textContent = '状态：双手缩放中';
+    } else if (twoHandScaling.active){
+      if (f1.index && f2.index){
+        const curDist = dist({x:h1.landmarks[8].x,y:h1.landmarks[8].y},{x:h2.landmarks[8].x,y:h2.landmarks[8].y});
+        const factor = curDist / twoHandScaling.startDist;
+        globalScale = Math.min(4, Math.max(0.3, twoHandScaling.startScale * factor));
+      } else {
+        twoHandScaling.active = false;
+        statusEl.textContent = '状态：等待手势';
+      }
+    }
+  } else {
+    twoHandScaling.active = false;
+  }
+
+  // Disperse trigger: if any hand has index+middle open simultaneously (as requested)
+  if (!dispersing){
+    for (const h of handsData){
+      if (isIndexAndMiddleOpen(h.landmarks)){
+        // start disperse
+        startDisperse();
+        break;
+      }
+    }
+  }
+
+  // draw hand landmarks for debugging / UX
+  drawHandsOverlay(handsData);
+
+  // update particles animation
+  updateParticles(dt);
+  drawParticles();
+
+  // draw status overlay
+  ctxOverlay.fillStyle = 'rgba(255,255,255,0.06)';
+  ctxOverlay.fillRect(8,8,0.5,0.5); // nothing, placeholder
+
+  // request next repaint (particles animate by requestAnimationFrame)
+}
+
+/* ---------- 渲染手部简要骨架和指示 ---------- */
+function drawHandsOverlay(handsData){
+  ctxOverlay.save();
+  ctxOverlay.lineWidth = 2;
+  for (const h of handsData){
+    const lm = h.landmarks;
+    // draw landmarks
+    for (let i=0;i<lm.length;i++){
+      const p = screenToCanvasXY(lm[i].x, lm[i].y);
+      ctxOverlay.beginPath();
+      ctxOverlay.fillStyle = 'rgba(255,255,255,0.7)';
+      ctxOverlay.arc(p.x, p.y, 4,0,Math.PI*2);
+      ctxOverlay.fill();
+    }
+    // draw connections for index and thumb for clarity
+    const idxTip = screenToCanvasXY(lm[8].x, lm[8].y);
+    const thumbTip = screenToCanvasXY(lm[4].x, lm[4].y);
+    ctxOverlay.beginPath();
+    ctxOverlay.moveTo(idxTip.x, idxTip.y);
+    ctxOverlay.lineTo(thumbTip.x, thumbTip.y);
+    ctxOverlay.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctxOverlay.stroke();
+    // show bounding palm center
+    const cx = (lm[0].x+lm[9].x+lm[5].x)/3;
+    const cy = (lm[0].y+lm[9].y+lm[5].y)/3;
+    const cp = screenToCanvasXY(cx,cy);
+    ctxOverlay.beginPath();
+    ctxOverlay.fillStyle = 'rgba(255,255,255,0.06)';
+    ctxOverlay.arc(cp.x, cp.y, 18,0,Math.PI*2);
+    ctxOverlay.fill();
+    // If panel visible, draw a connector line to panel
+    if (panelVisible){
+      const panelRect = panel.getBoundingClientRect();
+      const containerRect = document.getElementById('container').getBoundingClientRect();
+      const panelX = (panelRect.left + panelRect.width/2 - containerRect.left) / containerRect.width;
+      const panelY = (panelRect.top + panelRect.height/2 - containerRect.top) / containerRect.height;
+      const pPanel = screenToCanvasXY(panelX, panelY);
+      ctxOverlay.beginPath();
+      ctxOverlay.moveTo(cp.x, cp.y);
+      ctxOverlay.lineTo(pPanel.x, pPanel.y);
+      ctxOverlay.strokeStyle = 'rgba(110,231,183,0.18)';
+      ctxOverlay.stroke();
+    }
+  }
+  ctxOverlay.restore();
+}
+
+/* ---------- UI events ---------- */
+sizeRange.addEventListener('input', (e)=>{
+  penSize = +e.target.value;
+  sizeValue.textContent = penSize;
+});
+toolPen.addEventListener('click', ()=>{ selectedTool='pen'; applyUISelection(toolPen);});
+toolEraser.addEventListener('click', ()=>{ selectedTool='eraser'; applyUISelection(toolEraser);});
+colorSwatches.forEach(s=>{
+  s.addEventListener('click', ()=>{ selectedColor = s.dataset.color; applyUISelection(s);});
+});
+clearBtn.addEventListener('click', ()=>{ applyUISelection(clearBtn); });
+
+/* ---------- animation loop to keep particles moving and overlay updated ---------- */
+function animate(){
+  const now = performance.now();
+  const dt = (now - (animate._last || now)) / (1000/60); // normalize roughly to 60fps units
+  animate._last = now;
+  // clear overlay and redraw the persistent drawCanvas with transform applied to overlay,
+  // plus particles (these are drawn in onHandsResults too). This animate loop ensures particles move between frames even when no hands updated.
+  if (dispersing){
+    ctxOverlay.clearRect(0,0,overlay.width,overlay.height);
+    updateParticles(dt);
+    drawParticles();
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+/* ---------- 启动摄像头后，调整大小 ---------- */
+video.addEventListener('loadeddata', ()=>{
+  resizeCanvasesToVideo();
+});
+
+/* ---------- 友好提示：如果摄像头权限被拒绝 ---------- */
+navigator.mediaDevices.getUserMedia({video:true}).then(s=>{ /* do nothing: Camera started above */ }).catch(err=>{
+  alert('请允许摄像头权限以使用此示例。\n错误：' + err.message);
+});
+
+/* ---------- 结束 ---------- */
+</script>
 </body>
 </html>
-
