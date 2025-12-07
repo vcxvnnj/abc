@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI 隔空手势画板 (修复版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 使用 unpkg CDN，在国内有时候比 jsdelivr 稳定一点 -->
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        #output_canvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1;
+            transform: scaleX(-1); /* 镜像 */
+        }
+        #ui_overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none;
+        }
+        .loading-screen {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: #111; color: white;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 100; transition: opacity 0.5s;
+        }
+        .virtual-menu {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%) scale(0.8);
+            width: 80%; max-width: 400px;
+            background: rgba(20, 20, 20, 0.95);
+            border: 2px solid #00d2ff; border-radius: 20px;
+            padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px;
+            opacity: 0; transition: all 0.3s; pointer-events: none;
+        }
+        .virtual-menu.active { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+        .menu-item {
+            background: rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 15px;
+            text-align: center; color: white; border: 2px solid transparent;
+        }
+        .menu-item.selected { background: #00d2ff; color: black; }
+        .color-dot { width: 30px; height: 30px; border-radius: 50%; display: inline-block; border: 2px solid #fff; }
+        #debug_info {
+            position: absolute; top: 10px; left: 10px; color: yellow; font-family: monospace; font-size: 12px; z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 加载层 -->
+    <div id="loading" class="loading-screen">
+        <div class="text-3xl font-bold mb-4">🖐 初始化中...</div>
+        <div id="loading_text" class="text-sm text-gray-400 text-center px-4">
+            正在从 Google 下载 AI 模型 (约10MB)...<br>
+            如果长时间卡住，请检查网络或开启代理。<br>
+            <span style="color:red">请勿直接双击HTML文件打开，请使用 localhost 或 HTTPS</span>
+        </div>
+        <div class="mt-8 w-64 h-2 bg-gray-800 rounded overflow-hidden">
+            <div id="loading_bar" class="h-full bg-blue-500 w-0 transition-all duration-300"></div>
+        </div>
+    </div>
+
+    <video id="input_video" style="display:none"></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui_overlay">
+        <div id="debug_info">FPS: 0 | Model: Loading...</div>
+        <div class="absolute top-5 right-5 bg-black/50 px-4 py-2 rounded-full text-white text-sm">
+            <span id="current_tool">✏️ 画笔</span>
+        </div>
+
+        <div id="menu_panel" class="virtual-menu">
+            <div class="col-span-2 text-center text-white font-bold border-b border-gray-600 pb-2">工具箱 (食指悬停选择)</div>
+            <div class="menu-item" data-action="tool_pen">✏️ 画笔</div>
+            <div class="menu-item" data-action="tool_eraser">🧹 橡皮</div>
+            <div class="menu-item" data-action="color_red"><div class="color-dot" style="background:#f44"></div></div>
+            <div class="menu-item" data-action="color_green"><div class="color-dot" style="background:#4f4"></div></div>
+            <div class="menu-item" data-action="color_blue"><div class="color-dot" style="background:#44f"></div></div>
+            <div class="menu-item" data-action="clear_all">🗑️ 清空所有</div>
+        </div>
+        
+        <div class="absolute bottom-10 w-full text-center text-white/70 text-xs">
+            ✋ 张开手掌: 菜单 | 👌 捏合: 写字 | ☝️+✌️(剪刀手): 雪花消散
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingScreen = document.getElementById('loading');
+        const loadingBar = document.getElementById('loading_bar');
+        const debugInfo = document.getElementById('debug_info');
+        
+        let isModelLoaded = false;
+        let lastFrameTime = 0;
+        let particles = [];
+        
+        // 状态机
+        let state = {
+            menuOpen: false,
+            tool: 'pen',
+            color: '#ff4444',
+            lineWidth: 4,
+            scale: 1,
+            drawing: false,
+            menuTimer: 0
+        };
+
+        let strokes = []; // {points:[], color, width}
+        let currentLine = [];
+
+        // 调整画布尺寸
+        function resize() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.onresize = resize;
+        resize();
+
+        // --- 粒子系统 ---
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x; this.y = y; this.color = color;
+                this.vx = (Math.random()-0.5)*5; this.vy = Math.random()*5;
+                this.life = 1.0;
+            }
+            update() { this.x += this.vx; this.y += this.vy; this.life -= 0.02; }
+            draw(ctx) { 
+                ctx.globalAlpha = this.life; ctx.fillStyle = this.color; 
+                ctx.beginPath(); ctx.arc(this.x, this.y, 2, 0, Math.PI*2); ctx.fill(); 
+            }
+        }
+
+        // --- 核心逻辑 ---
+        function onResults(results) {
+            // 1. 首次成功检测：关闭加载层
+            if (!isModelLoaded) {
+                isModelLoaded = true;
+                loadingBar.style.width = "100%";
+                setTimeout(() => loadingScreen.style.opacity = 0, 500);
+                setTimeout(() => loadingScreen.style.display = 'none', 1000);
+            }
+
+            // 计算 FPS
+            const now = performance.now();
+            const fps = 1000 / (now - lastFrameTime);
+            lastFrameTime = now;
+            debugInfo.innerText = `FPS: ${fps.toFixed(1)} | Hands: ${results.multiHandLandmarks.length}`;
+
+            // 2. 绘制基础图层
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.fillStyle = 'rgba(0,0,0,0.4)'; // 变暗背景以便看清字
+            canvasCtx.fillRect(0,0, canvasElement.width, canvasElement.height);
+
+            // 3. 处理手势
+            if (results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const w = canvasElement.width;
+                const h = canvasElement.height;
+
+                // 获取关键点坐标 (镜像处理: x = 1 - x)
+                const indexTip = { x: (1 - landmarks[8].x) * w, y: landmarks[8].y * h };
+                const thumbTip = { x: (1 - landmarks[4].x) * w, y: landmarks[4].y * h };
+                const middleTip = { x: (1 - landmarks[12].x) * w, y: landmarks[12].y * h };
+                
+                // 绘制手部骨架
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00ff00', lineWidth: 1});
+
+                // --- 手势识别算法 ---
+                
+                // A. 计算距离
+                const pinchDist = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
+                const peaceDist = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y); // 食指与中指距离
+                const isHandOpen = landmarks[20].y < landmarks[18].y && landmarks[16].y < landmarks[14].y && landmarks[12].y < landmarks[10].y && landmarks[8].y < landmarks[6].y;
+
+                // B. 状态机逻辑
+                
+                // 1. 剪刀手消散 (食指中指分开，其他弯曲，这里简化为检测“V”字手势)
+                // 简单判定：食指中指都伸直，且离得比较远
+                if (!state.menuOpen && results.multiHandLandmarks.length === 1) {
+                    // 如果食指和中指指尖距离 > 50px (视情况调整) 且没有捏合
+                    if (Math.hypot(landmarks[8].x - landmarks[12].x, landmarks[8].y - landmarks[12].y) > 0.05 && pinchDist > 60) {
+                         // 触发雪花
+                         if (strokes.length > 0) {
+                             strokes.forEach(s => s.points.forEach(p => {
+                                 if(Math.random()>0.8) particles.push(new Particle(p.x, p.y, s.color));
+                             }));
+                             strokes = [];
+                             currentLine = [];
+                         }
+                    }
+                }
+
+                // 2. 菜单开关 (五指张开)
+                // 这里用简单的逻辑：如果是张开手掌且不是在画画
+                if (isHandOpen && pinchDist > 80) {
+                    if (!state.menuOpen) {
+                        state.menuOpen = true;
+                        document.getElementById('menu_panel').classList.add('active');
+                    }
+                } else if (state.menuOpen && pinchDist < 30) {
+                    // 在菜单模式下捏合，可能是误操作或想关闭，这里简化为如果不张开就尝试关闭
+                    // 为了体验，我们让菜单保持打开直到选择了东西，或者手离开
+                }
+
+                // 3. 菜单交互
+                if (state.menuOpen) {
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI*2);
+                    canvasCtx.fillStyle = 'cyan';
+                    canvasCtx.fill();
+                    
+                    checkMenuHover(indexTip.x, indexTip.y);
+                } 
+                // 4. 书写模式
+                else {
+                    // 捏合判定 (阈值 40像素)
+                    if (pinchDist < 40) {
+                        if (!state.drawing) {
+                            state.drawing = true;
+                            currentLine = [];
+                        }
+                        currentLine.push({x: indexTip.x, y: indexTip.y});
+                    } else {
+                        if (state.drawing) {
+                            state.drawing = false;
+                            if (currentLine.length > 0) {
+                                strokes.push({points: [...currentLine], color: state.color, width: state.lineWidth, tool: state.tool});
+                            }
+                        }
+                    }
+                    
+                    // 绘制笔尖光标
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(indexTip.x, indexTip.y, 5, 0, Math.PI*2);
+                    canvasCtx.fillStyle = state.drawing ? 'red' : 'white';
+                    canvasCtx.fill();
+                }
+            }
+
+            // 4. 渲染笔迹
+            strokes.forEach(s => drawLine(s));
+            if (state.drawing && currentLine.length > 0) {
+                drawLine({points: currentLine, color: state.color, width: state.lineWidth, tool: state.tool});
+            }
+
+            // 5. 渲染粒子
+            if (particles.length > 0) {
+                particles = particles.filter(p => p.life > 0);
+                particles.forEach(p => { p.update(); p.draw(canvasCtx); });
+            }
+
+            canvasCtx.restore();
+        }
+
+        function drawLine(stroke) {
+            if (stroke.points.length < 2) return;
+            canvasCtx.beginPath();
+            canvasCtx.lineWidth = stroke.width;
+            canvasCtx.lineCap = 'round';
+            canvasCtx.lineJoin = 'round';
+            canvasCtx.strokeStyle = stroke.tool === 'eraser' ? 'rgba(0,0,0,0.5)' : stroke.color;
+            // 橡皮擦其实应该用 globalCompositeOperation，但这里简化为半透明黑
+            
+            canvasCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
+            for(let i=1; i<stroke.points.length; i++) {
+                canvasCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
+            }
+            canvasCtx.stroke();
+        }
+
+        let selectionTimer = 0;
+        let lastSelected = null;
+
+        function checkMenuHover(x, y) {
+            const items = document.querySelectorAll('.menu-item');
+            let hovered = false;
+            
+            items.forEach(item => {
+                const rect = item.getBoundingClientRect();
+                if (x > rect.left && x < rect.right && y > rect.top && y < rect.bottom) {
+                    hovered = true;
+                    item.classList.add('selected');
+                    if (lastSelected !== item) {
+                        selectionTimer = 0;
+                        lastSelected = item;
+                    } else {
+                        selectionTimer++;
+                    }
+
+                    // 悬停 20 帧 (约0.5秒) 触发
+                    if (selectionTimer > 20) {
+                        const action = item.dataset.action;
+                        executeAction(action);
+                        state.menuOpen = false;
+                        document.getElementById('menu_panel').classList.remove('active');
+                        selectionTimer = 0;
+                    }
+                } else {
+                    item.classList.remove('selected');
+                }
+            });
+            
+            if (!hovered) { selectionTimer = 0; lastSelected = null; }
+        }
+
+        function executeAction(action) {
+            if (action === 'tool_pen') { state.tool = 'pen'; document.getElementById('current_tool').innerText = "✏️ 画笔"; }
+            if (action === 'tool_eraser') { state.tool = 'eraser'; state.color = '#000'; document.getElementById('current_tool').innerText = "🧹 橡皮"; }
+            if (action === 'color_red') { state.color = '#ff4444'; state.tool = 'pen'; }
+            if (action === 'color_green') { state.color = '#44ff44'; state.tool = 'pen'; }
+            if (action === 'color_blue') { state.color = '#4444ff'; state.tool = 'pen'; }
+            if (action === 'clear_all') { strokes = []; particles = []; }
+        }
+
+        // --- 初始化 MediaPipe ---
+        const hands = new Hands({locateFile: (file) => {
+            // 使用 unpkg 源，尝试解决国内加载问题
+            return `https://unpkg.com/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        // 超时检测
+        setTimeout(() => {
+            if (!isModelLoaded) {
+                alert("加载超时！\n1. 请检查网络连接。\n2. 中国大陆用户可能需要代理。\n3. 请确保使用 HTTPS 协议打开网页。");
+                document.getElementById('loading_text').innerHTML = "<span style='color:red'>模型下载失败，请刷新重试</span>";
+            }
+        }, 15000);
+
+        // 启动摄像头
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        
+        camera.start().then(() => {
+            console.log("摄像头已启动，正在等待模型...");
+            loadingBar.style.width = "50%";
+        }).catch(e => {
+            alert("摄像头启动失败: " + e.message);
+        });
+    </script>
+</body>
+</html>
+
